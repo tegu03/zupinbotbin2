@@ -1,0 +1,12 @@
+.env
+bot_state.json
+trades.db
+trades.db-wal
+trades.db-shm
+*.log
+__pycache__/
+*.pyc
+venv/
+.venv/
+.DS_Store
+Thumbs.db
