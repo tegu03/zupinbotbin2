@@ -106,7 +106,13 @@ async def run_cycle(ex):
         snap["min_notional"] = (ex.filters.get(sym) or {}).get("min_notional")
         snap["screener"] = c
         mse = await classify_regime(snap)
+        if not isinstance(mse, dict):  # lapis-2 pertahanan (lapis-1: llm.py _extract_json)
+            log.warning("%s: classify_regime kembalikan non-dict (%r) -> skip siklus", sym, type(mse))
+            continue
         pte = await analyze_trade(snap, mse)
+        if not isinstance(pte, dict):
+            log.warning("%s: analyze_trade kembalikan non-dict (%r) -> skip siklus", sym, type(pte))
+            continue
         d = evaluate(pte, mse, snap)
         log.info("%s: regime=%s signal=%s conf=%s approved=%s | %s", sym, d.get("regime"),
                  d.get("signal"), d.get("confidence_pct"), d["approved"], d["reasons"][0])
