@@ -41,16 +41,28 @@ async def kill_flow(ex, account):
 
 async def run_cycle(ex):
     account = await ex.get_account()
-    try:
-        import journal, reconcile
-        journal.record_snapshot(equity=account.get("equity_usd"),
-                                initial_capital=account.get("base_capital_usd"),
-                                unrealized=account.get("unrealized_pnl_usd"),
-                                daily_pnl=account.get("realized_pnl_today_usd"))
-        for _sym in CONFIG.symbols:
-            await reconcile.reconcile_native_closes(ex.c, _sym)
-    except Exception:
-        pass
+try:
+    import journal, reconcile
+
+    ok = journal.record_snapshot(
+        equity=account.get("equity_usd"),
+        initial_capital=account.get("base_capital_usd"),
+        unrealized=account.get("unrealized_pnl_usd"),
+        daily_pnl=account.get("realized_pnl_today_usd")
+    )
+
+    log.info(
+        "SNAPSHOT RESULT=%s equity=%s daily_pnl=%s",
+        ok,
+        account.get("equity_usd"),
+        account.get("realized_pnl_today_usd"),
+    )
+
+    for _sym in CONFIG.symbols:
+        await reconcile.reconcile_native_closes(ex.c, _sym)
+
+except Exception:
+    log.exception("Snapshot/Reconcile Error")
 
     guard = await ex.ensure_protection(account)
     if guard:
