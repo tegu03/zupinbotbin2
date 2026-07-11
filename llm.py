@@ -8,14 +8,20 @@ from prompts import MSE_SYSTEM, PTE_SYSTEM
 
 
 def _extract_json(s):
+    if s is None:
+        raise ValueError("LLM content kosong (content: null) -- kemungkinan respons "
+                         "tersaring/reasoning-only tanpa jawaban akhir")
     if not isinstance(s, str):
-        return s
+        raise ValueError(f"LLM content bukan string: {type(s).__name__}")
     t = re.sub(r"^```(?:json)?", "", s.strip())
     t = re.sub(r"```$", "", t.strip()).strip()
     a, b = t.find("{"), t.rfind("}")
     if a != -1 and b != -1:
         t = t[a:b + 1]
-    return json.loads(t)
+    result = json.loads(t)
+    if not isinstance(result, dict):
+        raise ValueError(f"LLM output bukan JSON object: {type(result).__name__}")
+    return result
 
 
 async def _chat(system, user):
