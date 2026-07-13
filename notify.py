@@ -81,10 +81,12 @@ def format_trade(decision, account, exec_result):
     lines.append(f"• Regime: {_esc(d.get('regime'))}")
     lines.append(f"• Entry: <b>${_f(d.get('entry'))}</b> ({_esc(d.get('entry_type'))})")
     lines.append(f"• SL 🛑 ${_f(d.get('stop'))}")
-    tp = f"• TP 🎯 ${_f(d.get('tp1'))}"
+    frac = d.get("tp1_close_frac")
+    frac_txt = f" (tutup {float(frac) * 100:g}%)" if frac else ""
+    lines.append(f"• TP1 🎯 ${_f(d.get('tp1'))} · RR 1:1{frac_txt}")
     if d.get("tp2"):
-        tp += f" → ${_f(d.get('tp2'))}"
-    lines.append(tp)
+        be_txt = " → SL sisa ke BE" if d.get("move_sl_to_be") else ""
+        lines.append(f"• TP2 🎯 ${_f(d.get('tp2'))} · RR 1:2{be_txt}")
     lines.append(f"• R:R ⚖️ {d.get('rr')} · risk 💵 ${_f(d.get('risk_usd'))} ({CONFIG.risk_pct * 100:g}%)")
     lines.append(f"• Size 📦 ${_f(d.get('notional_usd'))} · {d.get('base_amount')} {(d.get('symbol') or CONFIG.symbol)[:-4]}")
     if d.get("fee_est_usd") is not None:
@@ -114,9 +116,13 @@ def format_trade(decision, account, exec_result):
         elif prot.get("closed"):
             lines.append(f"⚡ <b>Posisi ditutup MARKET</b> — {_esc(prot.get('reason'))} "
                          "(SL/TP sudah terpenuhi saat pemasangan)")
+        elif prot.get("mode") == "native":
+            lines.append("🛡️ <b>Proteksi SL/TP: NATIVE di exchange</b> — SL + TP1 + TP2 conditional (cek Open Orders)\n"
+                         "   ✅ tersimpan di Binance; TP1 kena → SL sisa auto-geser ke break-even")
         elif prot.get("mode") == "synthetic":
             lines.append("🛡️ <b>Proteksi SL/TP: MODE SINTETIS</b> (dipantau bot, tutup MARKET saat harga kena)\n"
-                         "   ⚠️ hanya aktif selama bot hidup — bukan order tersimpan di exchange")
+                         "   ⚠️ hanya aktif selama bot hidup — bukan order tersimpan di exchange · "
+                         "native ditolak venue (mis. -4120 testnet) → fallback otomatis")
         elif prot.get("ok"):
             if prot.get("tp_verified") is False:
                 lines.append(f"🛡️ <b>SL terpasang &amp; TERVERIFIKASI</b> · ⚠️ TP gagal "
@@ -176,8 +182,11 @@ def format_online():
     mode = "🧪 DRY-RUN" if CONFIG.dry_run else f"🔴 LIVE {_venue()}"
     return (f"🤖 <b>Zupin Bot ONLINE</b> · {mode} · {CONFIG.symbol} · loop {CONFIG.loop_minutes} menit\n"
             f"• Eksekusi: Binance {_venue()} · Data: Binance MAINNET (funding/OI/LS riil) + F&amp;G\n"
+            f"• Multi-TF: trend {CONFIG.trend_interval} + entry {CONFIG.entry_interval} · "
+            f"anti counter-trend + ADX ≥ {CONFIG.adx_min:g} (anti-noise)\n"
+            f"• TP ladder: TP1 RR 1:1 (tutup {CONFIG.tp1_close_frac * 100:g}%) → SL sisa ke BE → TP2 RR 1:2\n"
             f"• Gerbang: conf ≥ {CONFIG.min_confidence:g}% · R:R ≥ {CONFIG.min_rr:g} · "
-            f"stop ≥ {CONFIG.min_stop_pct * 100:.2f}% · trend-only · min-notional aware\n"
+            f"stop ≥ {CONFIG.min_stop_pct * 100:.2f}% · min-notional aware\n"
             f"• Kill switch: -{CONFIG.daily_loss_limit_pct * 100:g}%/hari → flatten + pause s.d. "
             f"{(CONFIG.resume_hour + 7) % 24:02d}:00 WIB · Profit lock: +{CONFIG.daily_profit_target_pct * 100:g}%\n"
             f"• Proteksi: mode <b>{CONFIG.protection_mode}</b>"
@@ -189,7 +198,7 @@ def format_position_guard(pos, account, protection=None, synth=None, mark=None):
     lines.append("⏸️ <b>Posisi masih terbuka — entry baru diblokir</b> (guard)")
     lines.append(f"• Size: {_esc(pos.get('size'))} @ ${_f(pos.get('entry_price'))}")
     if synth:
-        sl, tp = synth.get("sl"), synth.get("tp")
+        sl, tp = synth.get("sl"), synth.get("tp2") or synth.get("tp1") or synth.get("tp")
         line = f"🛰️ <b>Proteksi SL/TP: MODE SINTETIS</b> — SL ${_f(sl)} · TP ${_f(tp)}"
         if mark is not None:
             line += f" · mark ${_f(mark)}"
@@ -224,6 +233,13 @@ def format_kill_switch(account, res, resume_str):
              f"• Bot PAUSE sampai {resume_str}",
              "", f"<i>Bukan nasihat finansial · Binance {_venue()}</i>"]
     return "\n".join(lines)
+
+
+def format_brake(streak, hours):
+    return ("🧯 <b>REM DARURAT AKTIF</b> — pola kerugian terdeteksi\n"
+            f"• {streak} SL beruntun (data jurnal riil) ≥ ambang {CONFIG.max_consec_sl}\n"
+            f"• Entry baru dijeda {hours:g} jam · posisi berjalan tetap dikelola SL/TP + guardian\n"
+            "• Modul lessons menaikkan syarat bukti utk simbol yang berulang gagal")
 
 
 def format_sleep(resume_str, secs):
