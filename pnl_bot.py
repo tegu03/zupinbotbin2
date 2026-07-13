@@ -18,8 +18,12 @@ import httpx
 
 import journal
 
-TOKEN = os.getenv("PNL_BOT_TOKEN", "")
+# v5.1: token KHUSUS v5. Telegram hanya mengizinkan SATU poller getUpdates per token —
+# memakai token yang sama dengan journal bot v4.1 PASTI bertabrakan (409 / update dicuri),
+# folder berbeda tidak berpengaruh. Buat bot baru di @BotFather utk v5.
+TOKEN = os.getenv("PNL_BOT_TOKEN_V5") or os.getenv("PNL_BOT_TOKEN", "")
 API = f"https://api.telegram.org/bot{TOKEN}"
+BOT_USERNAME = ""  # diisi via getMe saat start
 DISPLAY_COINS = [c.strip().upper() for c in os.getenv("PNL_COINS", "SOL,BTC,ETH").split(",") if c.strip()]
 _DEFAULT_ICONS = {"BTC": "🟠", "ETH": "🔷", "SOL": "🟣", "BNB": "🟡",
                   "XRP": "⚪", "DOGE": "🟡", "ADA": "🔵", "AVAX": "🔴"}
@@ -110,9 +114,11 @@ def render_daily(iso_date):
         lines.append("• <i>Belum ada snapshot akun untuk tanggal ini</i>")
     lines.append("")
 
+    be = s.get("be", 0)
+    be_txt = f" · BE ⚪ {be}" if be else ""
     lines.append(f"📈 <b>Trade {_iso_to_display(iso_date)}</b>")
-    lines.append(f"• Total: <b>{s['total']}</b> · TP ✅ {s['tp']} · SL 🛑 {s['sl']} · WR <b>{wr}%</b>" if wr is not None
-                 else f"• Total: <b>{s['total']}</b> · TP ✅ {s['tp']} · SL 🛑 {s['sl']} · WR —")
+    lines.append(f"• Total: <b>{s['total']}</b> · WIN ✅ {s['tp']} · SL 🛑 {s['sl']}{be_txt} · WR <b>{wr}%</b>" if wr is not None
+                 else f"• Total: <b>{s['total']}</b> · WIN ✅ {s['tp']} · SL 🛑 {s['sl']}{be_txt} · WR —")
     lines.append("")
 
     lines.append("🪙 <b>Per Coin</b>")
@@ -153,9 +159,11 @@ def render_period(label, start_iso, end_iso):
     lines.append(f"• Hari aktif: {s.get('active_days', 0)}")
     lines.append("")
 
+    be = s.get("be", 0)
+    be_txt = f" · BE ⚪ {be}" if be else ""
     lines.append(f"📋 <b>Trade {label}</b>")
-    lines.append(f"• Total: <b>{s['total']}</b> · TP ✅ {s['tp']} · SL 🛑 {s['sl']} · WR <b>{wr}%</b>" if wr is not None
-                 else f"• Total: <b>{s['total']}</b> · TP ✅ {s['tp']} · SL 🛑 {s['sl']} · WR —")
+    lines.append(f"• Total: <b>{s['total']}</b> · WIN ✅ {s['tp']} · SL 🛑 {s['sl']}{be_txt} · WR <b>{wr}%</b>" if wr is not None
+                 else f"• Total: <b>{s['total']}</b> · WIN ✅ {s['tp']} · SL 🛑 {s['sl']}{be_txt} · WR —")
     if s.get("realized_usd"):
         lines.append(f"• Realized PnL: {_dot(s['realized_usd'])} ${_sgn(s['realized_usd'])}")
     lines.append("")
@@ -172,7 +180,12 @@ def render_period(label, start_iso, end_iso):
 # ---- COMMAND HANDLER ----
 def handle_command(text):
     t = (text or "").strip()
-    cmd = t.split()[0].lower().split("@")[0] if t else ""
+    first = t.split()[0] if t else ""
+    # filter mention: /pnl@BotV41 di grup bersama BUKAN untuk bot ini -> abaikan
+    if "@" in first and BOT_USERNAME:
+        if first.split("@", 1)[1].lower() != BOT_USERNAME.lower():
+            return None
+    cmd = first.lower().split("@")[0]
 
     if cmd in ("/pnl", "/today"):
         arg = t.split(maxsplit=1)[1].strip() if (cmd == "/pnl" and len(t.split()) > 1) else ""
@@ -218,15 +231,34 @@ def send(chat_id, text, reply_to=None):
 
 
 def main():
+    global BOT_USERNAME
     if not TOKEN:
-        raise SystemExit("Set PNL_BOT_TOKEN dulu.")
+        raise SystemExit("Set PNL_BOT_TOKEN_V5 (atau PNL_BOT_TOKEN) dulu — token BARU dari "
+                         "@BotFather, JANGAN pakai token journal bot v4.1.")
     journal.init_db()
-    print("[pnl_bot] v2 online, polling…")
+    try:
+        me = httpx.get(f"{API}/getMe", timeout=20).json()
+        BOT_USERNAME = (me.get("result") or {}).get("username") or ""
+    except Exception as e:
+        print("[pnl_bot] getMe gagal:", e)
+    print(f"[pnl_bot] v2.1 online sebagai @{BOT_USERNAME or '?'} — polling…")
+    print("[pnl_bot] catatan: di grup bersama bot v4.1, panggil dengan mention: "
+          f"/pnl@{BOT_USERNAME or '<bot_v5>'}")
     offset = None
+    conflict_warned = False
     while True:
         try:
             r = httpx.get(f"{API}/getUpdates",
                           params={"offset": offset, "timeout": 30}, timeout=40)
+            if r.status_code == 409:
+                if not conflict_warned:
+                    print("[pnl_bot] ⚠️ KONFLIK 409: token ini SEDANG dipakai proses lain "
+                          "(kemungkinan journal bot v4.1). Telegram hanya mengizinkan 1 poller "
+                          "per token. Solusi: buat bot BARU di @BotFather dan set PNL_BOT_TOKEN_V5.")
+                    conflict_warned = True
+                time.sleep(10)
+                continue
+            conflict_warned = False
             for upd in r.json().get("result", []):
                 offset = upd["update_id"] + 1
                 msg = upd.get("message") or upd.get("channel_post")
