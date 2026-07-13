@@ -15,8 +15,13 @@ import re
 import time
 import datetime
 import httpx
+from dotenv import load_dotenv
 
 import journal
+
+# v6 FIX: pnl_bot dulu TIDAK membaca .env (beda dgn main.py yg load via config.py) -> token
+# di .env terabaikan & muncul "Set PNL_BOT_TOKEN_V5 dulu". Sekarang .env dibaca eksplisit.
+load_dotenv()
 
 # v5.1: token KHUSUS v5. Telegram hanya mengizinkan SATU poller getUpdates per token —
 # memakai token yang sama dengan journal bot v4.1 PASTI bertabrakan (409 / update dicuri),
