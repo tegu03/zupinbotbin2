@@ -1,8 +1,10 @@
-"""Lapisan database bersama v2: pencatatan trade & snapshot + agregasi per periode.
+"""Lapisan database bersama v2.1: pencatatan trade & snapshot + agregasi per periode.
 
 Dipakai DUA proses di VPS yang sama:
   - ZupinBot  : record_trade() saat posisi ditutup, record_snapshot() tiap siklus.
   - PnL bot   : stats_for_date(), stats_for_range() saat user kirim /pnl, /week, /month.
+v5.1: kolom regime/confidence/rr utk modul pembelajaran (lessons.py) + init malas
+(bot trading tidak memanggil init_db() — dulu INSERT gagal diam-diam di DB baru).
 """
 import os
 import time
@@ -25,6 +27,20 @@ def _conn():
     return c
 
 
+_INITED = False
+
+
+def _ensure_init():
+    """Init malas: tanpa ini, DB/kolom baru membuat INSERT gagal diam-diam (return False)."""
+    global _INITED
+    if not _INITED:
+        try:
+            init_db()
+            _INITED = True
+        except Exception:
+            pass
+
+
 def init_db():
     with closing(_conn()) as c:
         c.execute("""CREATE TABLE IF NOT EXISTS trades(
@@ -35,6 +51,10 @@ def init_db():
         cols = [r[1] for r in c.execute("PRAGMA table_info(trades)").fetchall()]
         if "order_id" not in cols:
             c.execute("ALTER TABLE trades ADD COLUMN order_id INTEGER")
+        # v5.1: metadata keputusan untuk modul pembelajaran (lessons.py)
+        for col, typ in (("regime", "TEXT"), ("confidence", "REAL"), ("rr", "REAL")):
+            if col not in cols:
+                c.execute(f"ALTER TABLE trades ADD COLUMN {col} {typ}")
         c.execute("""CREATE TABLE IF NOT EXISTS snapshots(
             ts INTEGER NOT NULL, date TEXT NOT NULL, equity REAL,
             initial_capital REAL, unrealized REAL, daily_pnl REAL)""")
@@ -45,23 +65,48 @@ def init_db():
 
 
 def record_trade(symbol, outcome, side=None, entry=None, exit_price=None,
-                 sl=None, tp=None, pnl_usd=None, mode="synthetic", order_id=None, ts=None):
+                 sl=None, tp=None, pnl_usd=None, mode="synthetic", order_id=None, ts=None,
+                 regime=None, confidence=None, rr=None):
     ts = int(ts or time.time())
+    _ensure_init()
     try:
         with closing(_conn()) as c:
             cur = c.execute(
-                """INSERT OR IGNORE INTO trades(ts,date,symbol,outcome,side,entry,exit_price,sl,tp,pnl_usd,mode,order_id)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                """INSERT OR IGNORE INTO trades(ts,date,symbol,outcome,side,entry,exit_price,sl,tp,pnl_usd,mode,order_id,regime,confidence,rr)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (ts, _date_wib(ts), str(symbol).upper(), str(outcome).upper(), side,
-                 entry, exit_price, sl, tp, pnl_usd, mode, order_id))
+                 entry, exit_price, sl, tp, pnl_usd, mode, order_id, regime, confidence, rr))
             c.commit()
             return cur.rowcount == 1
     except Exception:
         return False
 
 
+# v6: outcome ladder. WIN = target profit tercapai (penuh/sebagian), LOSS = SL murni.
+# TP1 = runner berakhir di break-even setelah TP1 dibank (tetap net-win).
+WIN_OUTCOMES = ("TP", "TP1", "TP2")
+LOSS_OUTCOMES = ("SL",)
+DECIDED_OUTCOMES = WIN_OUTCOMES + LOSS_OUTCOMES + ("BE",)
+
+
+def recent_trades(days=14):
+    """Trade terminal (TP/TP1/TP2/SL/BE) dalam N hari terakhir, urut waktu naik. Untuk lessons.py."""
+    since = _date_wib(time.time() - days * 86400)
+    _ensure_init()
+    try:
+        with closing(_conn()) as c:
+            qmarks = ",".join("?" * len(DECIDED_OUTCOMES))
+            return c.execute(
+                f"""SELECT ts,date,symbol,outcome,side,regime,confidence,rr,pnl_usd
+                   FROM trades WHERE date>=? AND outcome IN ({qmarks}) ORDER BY ts ASC""",
+                (since, *DECIDED_OUTCOMES)).fetchall()
+    except Exception:
+        return []
+
+
 def record_snapshot(equity, initial_capital, unrealized=0.0, daily_pnl=0.0, ts=None):
     ts = int(ts or time.time())
+    _ensure_init()
     try:
         with closing(_conn()) as c:
             c.execute("""INSERT INTO snapshots(ts,date,equity,initial_capital,unrealized,daily_pnl)
@@ -95,10 +140,13 @@ def _coin(symbol):
 
 
 def _aggregate(rows):
-    """Agregasi baris trade [(outcome, symbol, pnl_usd, mode, date)] -> dict stats."""
-    tp = sum(1 for r in rows if r[0] == "TP")
-    sl = sum(1 for r in rows if r[0] == "SL")
-    other = len(rows) - tp - sl
+    """Agregasi baris trade [(outcome, symbol, pnl_usd, mode, date)] -> dict stats.
+    v6: 'tp' = jumlah WIN (TP/TP1/TP2), 'sl' = LOSS, 'be' = break-even netral.
+    WR = win / (win + loss); BE tidak dihitung sbg menang/kalah."""
+    tp = sum(1 for r in rows if r[0] in WIN_OUTCOMES)
+    sl = sum(1 for r in rows if r[0] in LOSS_OUTCOMES)
+    be = sum(1 for r in rows if r[0] == "BE")
+    other = len(rows) - tp - sl - be
     per_coin, per_mode, per_day, realized = {}, {}, {}, 0.0
     for outcome, symbol, pnl, mode, date in rows:
         coin = _coin(symbol)
@@ -110,7 +158,7 @@ def _aggregate(rows):
     decided = tp + sl
     wr = round(tp / decided * 100) if decided else None
     return {
-        "total": len(rows), "tp": tp, "sl": sl, "other": other,
+        "total": len(rows), "tp": tp, "sl": sl, "be": be, "other": other,
         "wr": wr, "per_coin": per_coin, "per_mode": per_mode,
         "per_day": per_day, "realized_usd": round(realized, 2),
         "active_days": len(per_day),
