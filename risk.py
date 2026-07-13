@@ -1,16 +1,15 @@
-"""DETERMINISTIC Risk Governor v4.1 (Binance). AI mengusulkan; kode ini memutuskan.
+"""DETERMINISTIC Risk Governor v5.1 (Binance). AI mengusulkan; kode ini memutuskan.
 
 Gerbang (SEMUA harus lolos):
   1. Sinyal actionable (long/short)
   2. Regime alignment: trending_up->long, trending_down->short,
      ranging->long/short (mean reversion diizinkan), chop->NO-TRADE
-  3. Confidence >= MIN_CONFIDENCE (65)
+  3. Confidence >= MIN_CONFIDENCE (+ penalti histori per simbol dari lessons)
   4. Geometry valid + R:R >= MIN_RR (2.0)
-  5. Stop >= MIN_STOP_PCT (0.35%) -- stop mikro di dalam noise = realized risk >> rencana
+  5. Stop >= max(MIN_STOP_PCT, ATR_STOP_MULT x ATR%) -- v5.1: floor statis terbukti
+     terlalu sempit utk alt 15m; stop di dalam noise ATR = SL kena wick beruntun
   6. Sizing dari STOP (fixed fractional); notional <= max_leverage x equity
-  7. NOTIONAL >= minimum Binance (live dari exchangeInfo) -- akun terlalu kecil
-     tidak bisa patuh aturan 1%; lebih baik ditolak di sini dengan alasan jelas
-     daripada error diam-diam dari exchange
+  7. NOTIONAL >= minimum Binance (live dari exchangeInfo)
   8. Kill switch: daily <= -3% -> kill_switch=True
   9. Profit lock: daily >= +target -> profit_lock=True
 Plus: estimasi fee round-trip (worst case 2x taker) dilaporkan; fee yang memakan
@@ -29,7 +28,13 @@ def _num(x):
 
 def evaluate(pte, mse, snapshot):
     cfg = CONFIG
-    acc = snapshot.get("account", {})
+    # v6 FIX #1: snapshot["account"] bisa bernilai None (key ADA tapi value None) — pola
+    # .get("account", {}) HANYA memberi default saat key HILANG, bukan saat value None ->
+    # 'NoneType' object has no attribute 'get'. Pakai `or {}` untuk menutup kedua kasus.
+    snapshot = snapshot or {}
+    pte = pte if isinstance(pte, dict) else {}
+    mse = mse if isinstance(mse, dict) else {}
+    acc = snapshot.get("account") or {}
     equity = _num(acc.get("equity_usd")) or cfg.initial_capital
     reasons, approved = [], True
     kill_switch = False
@@ -57,11 +62,37 @@ def evaluate(pte, mse, snapshot):
         elif regime == "ranging":
             reasons.append(f"Regime ranging -> mean reversion DIIZINKAN ({signal})")
 
+    # v6 GERBANG #6: TREND 1H (higher-timeframe) — DILARANG entry melawan trend 1H.
+    # Ini gerbang deterministik (bukan bergantung AI): sumber utama SL beruntun adalah
+    # entry counter-trend pada pullback yang ternyata reversal.
+    htf = snapshot.get("htf_trend") or {}
+    htf_dir = str(htf.get("trend") or "mixed")
+    if cfg.htf_align_required and signal in ("long", "short") and htf_dir in ("up", "down"):
+        if signal == "long" and htf_dir != "up":
+            approved = False
+            reasons.append(f"LONG melawan trend 1H ({htf_dir}) -> DITOLAK (anti counter-trend)")
+        elif signal == "short" and htf_dir != "down":
+            approved = False
+            reasons.append(f"SHORT melawan trend 1H ({htf_dir}) -> DITOLAK (anti counter-trend)")
+
+    # v6 GERBANG #7: ADX entry-TF — buang chop (pasar tanpa trend = noise & whipsaw).
+    adx = _num((snapshot.get("technicals") or {}).get("adx_14"))
+    if signal in ("long", "short") and adx is not None and adx < cfg.adx_min:
+        approved = False
+        reasons.append(f"ADX {adx:.1f} < {cfg.adx_min:g} -> pasar chop/tanpa trend (noise) -> NO-TRADE")
+
+    # v5.1 PEMBELAJARAN: simbol dgn rekam jejak buruk (data jurnal riil) butuh bukti lebih kuat
+    mem = snapshot.get("memory_adjust") or {}
+    sym_trade = snapshot.get("symbol_trade") or CONFIG.symbol
+    extra_conf = _num((mem.get("extra_conf") or {}).get(sym_trade)) or 0.0
+    min_conf_eff = cfg.min_confidence + extra_conf
+
     conf = _num(pte.get("confidence_pct"))
     if signal in ("long", "short"):
-        if conf is None or conf < cfg.min_confidence:
+        if conf is None or conf < min_conf_eff:
+            note = f" (dasar {cfg.min_confidence:.0f}% + penalti histori {extra_conf:.0f}%)" if extra_conf else ""
             approved = False
-            reasons.append(f"Confidence {conf if conf is not None else 0:.0f}% < minimum {cfg.min_confidence:.0f}%")
+            reasons.append(f"Confidence {conf if conf is not None else 0:.0f}% < minimum {min_conf_eff:.0f}%{note}")
 
     entry_obj = pte.get("entry") or {}
     entry = _num(entry_obj.get("price"))
@@ -69,32 +100,52 @@ def evaluate(pte, mse, snapshot):
         zone = entry_obj.get("zone") or [None]
         entry = _num(zone[0])
     stop = _num(pte.get("invalidation"))
-    targets = pte.get("targets") or []
-    tp1 = _num(targets[0]) if len(targets) > 0 else None
-    tp2 = _num(targets[1]) if len(targets) > 1 else None
 
     if signal in ("long", "short") and (entry is None or stop is None):
         approved = False
         reasons.append("Missing entry or invalidation")
 
+    # v6 #9: TP LADDER DETERMINISTIK dari geometri risk (R = |entry - stop|).
+    # TP1 = entry +/- TP1_RR*R (RR 1:1), TP2 = entry +/- TP2_RR*R (RR 1:2).
+    # Target AI TIDAK dipakai untuk ladder -> geometri konsisten, tidak bisa "digelembungkan".
     rr = stop_dist = risk_usd = notional = base_amount = side = fee_est = None
-    if entry is not None and stop is not None and tp1 is not None:
+    tp1 = tp2 = None
+    if entry is not None and stop is not None and entry > 0:
         risk_dist = abs(entry - stop)
-        reward_dist = abs(tp1 - entry)
-        rr = reward_dist / risk_dist if risk_dist > 0 else 0
-        if signal == "long" and not (stop < entry < tp1):
+        if signal == "long" and not (stop < entry):
             approved = False
-            reasons.append("Long geometry invalid (need stop<entry<tp1)")
-        if signal == "short" and not (stop > entry > tp1):
+            reasons.append("Long geometry invalid (need stop < entry)")
+        if signal == "short" and not (stop > entry):
             approved = False
-            reasons.append("Short geometry invalid (need stop>entry>tp1)")
+            reasons.append("Short geometry invalid (need stop > entry)")
+        if risk_dist <= 0:
+            approved = False
+            reasons.append("Risk distance nol (entry == invalidation)")
+        else:
+            if signal == "long":
+                tp1 = entry + cfg.tp1_rr * risk_dist
+                tp2 = entry + cfg.tp2_rr * risk_dist
+            elif signal == "short":
+                tp1 = entry - cfg.tp1_rr * risk_dist
+                tp2 = entry - cfg.tp2_rr * risk_dist
+        # RR sistem diukur ke TP2 (target maksimum). Dgn ladder ini rr == tp2_rr.
+        rr = cfg.tp2_rr
         if rr < cfg.min_rr:
             approved = False
-            reasons.append(f"R:R {rr:.2f} < min {cfg.min_rr}")
+            reasons.append(f"R:R ke TP2 {rr:.2f} < min {cfg.min_rr} (cek TP2_RR/MIN_RR)")
         stop_dist = risk_dist / entry if entry > 0 else 0
-        if stop_dist < cfg.min_stop_pct:
+        # v5.1 KALIBRASI: floor stop ATR-aware. Floor statis 0.5% terbukti terlalu SEMPIT
+        # utk alt 15m (ATR sering >1%) -> stop di dalam noise -> SL kena wick beruntun.
+        atr = _num((snapshot.get("technicals") or {}).get("atr_14"))
+        last_px = _num((snapshot.get("price") or {}).get("last"))
+        atr_pct = (atr / last_px) if (atr and last_px) else None
+        min_stop_eff = max(cfg.min_stop_pct, cfg.atr_stop_mult * atr_pct) if atr_pct else cfg.min_stop_pct
+        if stop_dist < min_stop_eff:
             approved = False
-            reasons.append(f"Stop {stop_dist * 100:.3f}% < minimum {cfg.min_stop_pct * 100:.2f}% (stop mikro)")
+            src = (f"{cfg.atr_stop_mult:g}xATR ({atr_pct * 100:.2f}%)" if (atr_pct and min_stop_eff > cfg.min_stop_pct)
+                   else f"floor statis {cfg.min_stop_pct * 100:.2f}%")
+            reasons.append(f"Stop {stop_dist * 100:.3f}% < minimum {min_stop_eff * 100:.3f}% [{src}] -- "
+                           "stop di dalam noise = SL kena wick, bukan invalidasi tesis")
         risk_usd = equity * cfg.risk_pct
         notional = risk_usd / stop_dist if stop_dist > 0 else 0
         cap = equity * cfg.max_leverage
@@ -119,7 +170,7 @@ def evaluate(pte, mse, snapshot):
                            f"{fee_est / risk_usd * 100:.0f}% dari risk -- perlebar stop / pakai limit (maker)")
     elif signal in ("long", "short"):
         approved = False
-        reasons.append("Missing TP1 for R:R / sizing")
+        reasons.append("Entry/invalidation tidak valid untuk geometri & sizing")
 
     ev = str(pte.get("event_risk") or "")
     if ev and any(w in ev.lower() for w in ("high-impact", "imminent", "within hours", "fomc", "cpi", "nfp", "expiry")):
@@ -150,8 +201,14 @@ def evaluate(pte, mse, snapshot):
         "confidence_pct": pte.get("confidence_pct"),
         "entry": entry,
         "stop": stop,
-        "tp1": tp1,
-        "tp2": tp2,
+        "tp1": tp1,                       # RR 1:1 — ditutup sebagian (tp1_close_frac)
+        "tp2": tp2,                       # RR 1:2 — target maksimum sisa posisi
+        "tp1_rr": cfg.tp1_rr,
+        "tp2_rr": cfg.tp2_rr,
+        "tp1_close_frac": cfg.tp1_close_frac,
+        "move_sl_to_be": cfg.move_sl_to_be,
+        "htf_trend": htf_dir,
+        "adx": adx,
         "entry_type": ("market" if cfg.force_market_entry else (entry_obj.get("type") or "limit")),
         "rr": round(rr, 2) if rr is not None else None,
         "stop_distance_pct": round(stop_dist * 100, 3) if stop_dist is not None else None,
