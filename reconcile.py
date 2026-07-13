@@ -23,7 +23,11 @@ async def reconcile_native_closes(client, symbol, limit=50):
         cp = str(o.get("closePosition")).lower() == "true"
         ro = str(o.get("reduceOnly")).lower() in ("true", "1")
         if not (cp or ro): continue
-        outcome = "SL" if "STOP" in typ else "TP"
+        # v6: STOP->SL. TAKE_PROFIT: partial reduceOnly (bukan closePosition) = TP1, penuh = TP2.
+        if "STOP" in typ:
+            outcome = "SL"
+        else:
+            outcome = "TP2" if cp else "TP1"
         trig = _num(o.get("stopPrice"))
         ts = int(int(o.get("updateTime") or o.get("time") or 0) / 1000) or None
         if journal.record_trade(symbol=symbol, outcome=outcome,
