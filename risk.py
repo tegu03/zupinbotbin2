@@ -75,6 +75,21 @@ def evaluate(pte, mse, snapshot):
             approved = False
             reasons.append(f"SHORT melawan trend 1H ({htf_dir}) -> DITOLAK (anti counter-trend)")
 
+    # v6.1 GERBANG #6b: BARRIER EMA200(1H) — celah "mixed" ditutup (kasus VANRY).
+    # DILARANG long di bawah EMA200 1H, DILARANG short di atasnya. Deterministik & tegas:
+    # tidak peduli 15m lokal terlihat naik, kalau harga di bawah trend besar -> bukan long.
+    last_px_htf = _num((snapshot.get("price") or {}).get("last"))
+    ema200_htf = _num(htf.get("ema200"))
+    if signal in ("long", "short") and last_px_htf and ema200_htf:
+        if signal == "long" and last_px_htf < ema200_htf:
+            approved = False
+            reasons.append(f"LONG DITOLAK: harga di BAWAH EMA200(1H) ({last_px_htf:g} < {ema200_htf:g}) "
+                           "-- di bawah trend besar, bukan zona beli (anti pullback-trap)")
+        elif signal == "short" and last_px_htf > ema200_htf:
+            approved = False
+            reasons.append(f"SHORT DITOLAK: harga di ATAS EMA200(1H) ({last_px_htf:g} > {ema200_htf:g}) "
+                           "-- di atas trend besar, bukan zona jual")
+
     # v6 GERBANG #7: ADX entry-TF — buang chop (pasar tanpa trend = noise & whipsaw).
     adx = _num((snapshot.get("technicals") or {}).get("adx_14"))
     if signal in ("long", "short") and adx is not None and adx < cfg.adx_min:
@@ -133,6 +148,25 @@ def evaluate(pte, mse, snapshot):
         if rr < cfg.min_rr:
             approved = False
             reasons.append(f"R:R ke TP2 {rr:.2f} < min {cfg.min_rr} (cek TP2_RR/MIN_RR)")
+
+        # v6.1 GERBANG ORDER BLOCK: jangan entry MENEMBUS zona S/R lawan sebelum TP1.
+        # Long tepat di bawah resistance (order block) = R:R semu, kemungkinan besar ditolak market.
+        # Level S/R kini akurat utk coin murah (fix pembulatan di data.py).
+        tech = snapshot.get("technicals") or {}
+        res_levels = sorted(r for r in (_num(x) for x in (tech.get("resistance_levels") or [])) if r)
+        sup_levels = sorted(s for s in (_num(x) for x in (tech.get("support_levels") or [])) if s)
+        if signal == "long" and tp1 is not None:
+            wall = next((r for r in res_levels if r > entry), None)
+            if wall is not None and wall < tp1:
+                approved = False
+                reasons.append(f"LONG ditolak: resistance {wall:g} di antara entry & TP1 "
+                               f"({entry:g}→{tp1:g}) -- long menembus ORDER BLOCK, R:R semu")
+        elif signal == "short" and tp1 is not None:
+            floor_lvl = next((s for s in reversed(sup_levels) if s < entry), None)
+            if floor_lvl is not None and floor_lvl > tp1:
+                approved = False
+                reasons.append(f"SHORT ditolak: support {floor_lvl:g} di antara entry & TP1 "
+                               f"({entry:g}→{tp1:g}) -- short menembus ORDER BLOCK")
         stop_dist = risk_dist / entry if entry > 0 else 0
         # v5.1 KALIBRASI: floor stop ATR-aware. Floor statis 0.5% terbukti terlalu SEMPIT
         # utk alt 15m (ATR sering >1%) -> stop di dalam noise -> SL kena wick beruntun.
