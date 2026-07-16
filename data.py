@@ -19,6 +19,7 @@ Endpoint Binance (semua publik mainnet, tanpa API key):
   - alternative.me         Fear & Greed
 """
 import time
+import math
 import datetime
 import httpx
 from config import CONFIG
@@ -36,6 +37,18 @@ def _num(x):
         return v if v == v else None
     except (TypeError, ValueError):
         return None
+
+
+def _r(x, sig=5):
+    """v6.1 FIX: pembulatan ADAPTIF menjaga signifikansi. round(x,2) menghancurkan coin
+    murah (VANRY 0.0057 -> 0.01) sehingga S/R, Bollinger, MACD, ATR jadi 0.00 & tak berguna."""
+    v = _num(x)
+    if v is None:
+        return None
+    if v == 0:
+        return 0.0
+    d = sig - 1 - int(math.floor(math.log10(abs(v))))
+    return round(v, max(0, min(d, 12)))
 
 
 def _sma(a, n):
@@ -137,11 +150,14 @@ def _htf_trend(closes):
     # Butuh pemisahan EMA & kemiringan minimal -> jauh dari sekadar noise floating point.
     sep = ((ema50 - ema200) / ema200 * 100) if (ema50 and ema200) else 0.0
     SEP_MIN, SLOPE_MIN = 0.10, 0.02
+    # v6.1 FIX (kasus VANRY): trend didefinisikan oleh STRUKTUR EMA50-vs-EMA200 + kemiringan,
+    # BUKAN posisi harga sesaat. Dulu syarat "last<ema50" utk down membuat pullback ke EMA50
+    # (justru titik SHORT) malah terklasifikasi "mixed" -> gerbang bypass -> LONG counter-trend.
     trend = "mixed"
     if ema50 and ema200:
-        if last > ema50 and sep > SEP_MIN and slope > SLOPE_MIN:
+        if sep > SEP_MIN and slope > SLOPE_MIN:
             trend = "up"
-        elif last < ema50 and sep < -SEP_MIN and slope < -SLOPE_MIN:
+        elif sep < -SEP_MIN and slope < -SLOPE_MIN:
             trend = "down"
     return {"trend": trend,
             "ema50": round(ema50, 6) if ema50 else None,
@@ -157,7 +173,7 @@ def _bollinger(closes, period=20, std_mult=2):
     mid = sum(window) / period
     variance = sum((x - mid) ** 2 for x in window) / period
     std = variance ** 0.5
-    return round(mid + std_mult * std, 2), round(mid, 2), round(mid - std_mult * std, 2)
+    return _r(mid + std_mult * std), _r(mid), _r(mid - std_mult * std)
 
 
 def _swing_levels(highs, lows, lookback=5):
@@ -168,10 +184,10 @@ def _swing_levels(highs, lows, lookback=5):
     for i in range(lookback, len(highs) - lookback):
         # swing high: higher than lookback bars on both sides
         if highs[i] == max(highs[i - lookback:i + lookback + 1]):
-            resistances.append(round(highs[i], 2))
+            resistances.append(_r(highs[i], 6))
         # swing low: lower than lookback bars on both sides
         if lows[i] == min(lows[i - lookback:i + lookback + 1]):
-            supports.append(round(lows[i], 2))
+            supports.append(_r(lows[i], 6))
     # Return most recent 5 levels, deduplicated
     supports = sorted(set(supports))[-5:]
     resistances = sorted(set(resistances))[-5:]
@@ -257,7 +273,7 @@ def build_snapshot(raw, account, symbol=None):
     rsi_14 = _rsi(closes, 14)
     ema_12 = _ema(closes, 12)
     ema_26 = _ema(closes, 26)
-    macd_line = round(ema_12 - ema_26, 2) if (ema_12 is not None and ema_26 is not None) else None
+    macd_line = _r(ema_12 - ema_26, 6) if (ema_12 is not None and ema_26 is not None) else None
     atr_14 = _atr(highs, lows, closes, 14)
     bb_upper, bb_mid, bb_lower = _bollinger(closes, 20, 2)
     # v6: ADX entry-TF (kekuatan trend, saring chop)
@@ -340,10 +356,10 @@ def build_snapshot(raw, account, symbol=None):
         },
         "technicals": {
             "rsi_14": rsi_14,
-            "ema_12": round(ema_12, 2) if ema_12 else None,
-            "ema_26": round(ema_26, 2) if ema_26 else None,
+            "ema_12": _r(ema_12, 6) if ema_12 else None,
+            "ema_26": _r(ema_26, 6) if ema_26 else None,
             "macd_line": macd_line,
-            "atr_14": round(atr_14, 2) if atr_14 else None,
+            "atr_14": _r(atr_14, 6) if atr_14 else None,
             "adx_14": adx_14, "plus_di": plus_di, "minus_di": minus_di,
             "bollinger": {"upper": bb_upper, "mid": bb_mid, "lower": bb_lower},
             "support_levels": supports,
