@@ -49,11 +49,18 @@ class Exchange:
         missing = [s for s in CONFIG.symbols if s not in by]
         if missing: raise RuntimeError(f"Simbol tidak ada di venue: {missing}")
         for sym in CONFIG.symbols:
-            f = {"tick": None, "step": None, "min_qty": None, "min_notional": None}
+            # v6 FIX -4005: baca max_qty (LOT_SIZE) & max_qty_market (MARKET_LOT_SIZE).
+            # Coin murah (VANRY/DOGE) -> qty raksasa; tutup MARKET sekali >= maxQty = -4005 -> harus dipecah.
+            f = {"tick": None, "step": None, "min_qty": None, "min_notional": None,
+                 "max_qty": None, "max_qty_market": None}
             for flt in by[sym].get("filters", []):
                 ft = flt.get("filterType")
                 if ft == "PRICE_FILTER": f["tick"] = float(flt.get("tickSize"))
-                elif ft == "LOT_SIZE": f["step"] = float(flt.get("stepSize")); f["min_qty"] = float(flt.get("minQty"))
+                elif ft == "LOT_SIZE":
+                    f["step"] = float(flt.get("stepSize")); f["min_qty"] = float(flt.get("minQty"))
+                    f["max_qty"] = float(flt.get("maxQty") or 0) or None
+                elif ft == "MARKET_LOT_SIZE":
+                    f["max_qty_market"] = float(flt.get("maxQty") or 0) or None
                 elif ft in ("MIN_NOTIONAL", "NOTIONAL"): f["min_notional"] = float(flt.get("notional") or flt.get("minNotional") or 0)
             if not (f["tick"] and f["step"]): raise RuntimeError(f"filter {sym} tak terbaca")
             self.filters[sym] = f
@@ -181,19 +188,45 @@ class Exchange:
             await self.c.sdelete("/fapi/v1/allOpenOrders", symbol=sym); return True
         return False
 
+    async def _market_reduce_chunked(self, sym, qty, side):
+        """v6 FIX -4005: tutup posisi via MARKET reduceOnly, DIPECAH sesuai MARKET_LOT_SIZE.maxQty.
+        Coin murah -> qty raksasa melebihi max per-order; satu order = ditolak -4005 -> nyangkut.
+        reduceOnly menjamin tidak pernah melebihi posisi meski dipecah beberapa order."""
+        f = self.filters.get(sym) or {}
+        step = f.get("step") or 0
+        cap = f.get("max_qty_market") or f.get("max_qty") or qty
+        if cap <= 0:
+            cap = qty
+        remaining = float(qty)
+        sent = 0.0
+        errors = []
+        guard = 0
+        while remaining >= (step or 1e-12) and guard < 50:
+            guard += 1
+            chunk = min(remaining, cap)
+            qty_str, q = self.fmt_qty(chunk, sym)
+            if q <= 0:
+                break
+            try:
+                await self.c.spost("/fapi/v1/order", symbol=sym, side=side, type="MARKET",
+                                   quantity=qty_str, reduceOnly="true")
+                sent += q
+                remaining -= q
+            except Exception as e:
+                errors.append(f"{type(e).__name__}: {e}")
+                break
+        if errors:
+            return {"ok": False, "error": "; ".join(errors), "closed_qty": round(sent, 8)}
+        return {"ok": True, "closed_qty": round(sent, 8)}
+
     async def close_position_market(self, sym):
         acc = await self.get_account()
         pos = next((p for p in self.open_positions(acc) if p.get("market") == sym), None)
         if not pos: return {"ok": True, "note": "no position"}
-        qty_str, qty = self.fmt_qty(abs(float(pos["size"])), sym)
-        if qty <= 0: return {"ok": False, "error": "size rounds to 0"}
+        total = abs(float(pos["size"]))
+        if total <= 0: return {"ok": False, "error": "size rounds to 0"}
         side = "SELL" if self._position_is_long(pos) else "BUY"
-        try:
-            await self.c.spost("/fapi/v1/order", symbol=sym, side=side, type="MARKET",
-                               quantity=qty_str, reduceOnly="true")
-            return {"ok": True}
-        except Exception as e:
-            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        return await self._market_reduce_chunked(sym, total, side)
 
     # ==== LADDER helper (dipakai native & sintetis) ====
     @staticmethod
@@ -205,8 +238,8 @@ class Exchange:
                 "tp1_frac": frac, "move_be": bool(move_be), "ladder": is_ladder}
 
     async def close_partial_market(self, sym, qty):
-        """Tutup SEBAGIAN posisi (reduceOnly) — dipakai TP1 50%."""
-        qty_str, q = self.fmt_qty(qty, sym)
+        """Tutup SEBAGIAN posisi (reduceOnly) — dipakai TP1 50%. Dipecah sesuai maxQty (fix -4005)."""
+        _qs, q = self.fmt_qty(qty, sym)
         if q <= 0:
             return {"ok": False, "error": "partial qty rounds to 0"}
         acc = await self.get_account()
@@ -214,12 +247,10 @@ class Exchange:
         if not pos:
             return {"ok": True, "note": "no position"}
         side = "SELL" if self._position_is_long(pos) else "BUY"
-        try:
-            await self.c.spost("/fapi/v1/order", symbol=sym, side=side, type="MARKET",
-                               quantity=qty_str, reduceOnly="true")
-            return {"ok": True, "qty": q}
-        except Exception as e:
-            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        r = await self._market_reduce_chunked(sym, q, side)
+        if r.get("ok"):
+            r["qty"] = r.get("closed_qty")
+        return r
 
     # ==== PROTEKSI NATIVE (STOP_MARKET / TAKE_PROFIT_MARKET di exchange) ====
     async def _place_cond(self, sym, side, stop_price, qty=None, close_position=False, kind="STOP_MARKET"):
@@ -302,7 +333,9 @@ class Exchange:
                             "tp1_frac": lad["tp1_frac"], "move_be": lad["move_be"],
                             "ladder": lad["ladder"], "close_side": close_side,
                             "is_long": close_side == "SELL", "meta": meta or {},
-                            "tp1_done": False, "moved_be": False, "orig_qty": None, "realized": 0.0}
+                            "tp1_done": False, "moved_be": False, "orig_qty": None, "realized": 0.0,
+                            # v6.1 MFE: sl0 = SL awal (R = |entry-sl0|); mfe_price = ekstrem favorable
+                            "sl0": lad["sl"], "entry_ref": None, "mfe_price": None}
         t = self._synth_tasks.get(sym)
         if t and not t.done(): t.cancel()
         self._synth_tasks[sym] = asyncio.create_task(self._synth_loop(sym))
@@ -331,22 +364,35 @@ class Exchange:
                 if s["orig_qty"] is None and amt != 0:
                     s["orig_qty"] = abs(amt)
                 is_long = s["is_long"]
+                # v6.1 MFE: rekam entry acuan & ekstrem harga favorable (utk analisa trailing nanti)
+                if s.get("entry_ref") is None and entry_px:
+                    s["entry_ref"] = entry_px
+                if mark is not None:
+                    s["mfe_price"] = mark if s.get("mfe_price") is None else (
+                        max(s["mfe_price"], mark) if is_long else min(s["mfe_price"], mark))
 
                 if not s["tp1_done"]:
                     if self._breached("sl", is_long, mark, s["sl"]):
                         r = await self.close_position_market(sym)
+                        if not r.get("ok"):
+                            await self._close_fail(sym, s, r); continue   # JANGAN menyerah: retry
                         pnl = round((mark - entry_px) * amt, 4) if entry_px else None
                         await self._synth_close(sym, s, mark, "SL", r, entry_px, pnl)
                         self._synth.pop(sym, None); return
                     if self._breached("tp", is_long, mark, s["tp1"]):
                         if not s["ladder"]:
                             r = await self.close_position_market(sym)
+                            if not r.get("ok"):
+                                await self._close_fail(sym, s, r); continue
                             pnl = round((mark - entry_px) * amt, 4) if entry_px else None
                             await self._synth_close(sym, s, mark, "TP2", r, entry_px, pnl)
                             self._synth.pop(sym, None); return
                         # ladder: tutup sebagian di TP1, sisanya lanjut ke TP2
                         close_qty = (s["orig_qty"] or abs(amt)) * s["tp1_frac"]
                         r = await self.close_partial_market(sym, close_qty)
+                        if not r.get("ok"):
+                            await self._close_fail(sym, s, r); continue   # TP1 gagal -> retry, jangan tandai selesai
+                        s["fail_notified"] = False
                         pnl1 = round((mark - entry_px) * (amt * s["tp1_frac"]), 4) if entry_px else 0.0
                         s["realized"] += pnl1 or 0.0
                         s["tp1_done"] = True
@@ -358,17 +404,21 @@ class Exchange:
                         with contextlib.suppress(Exception):
                             from notify import send
                             be_txt = f" · SL sisa → BE ${s['sl']:,.4f}" if s["moved_be"] else ""
-                            await send(f"🎯 <b>TP1 kena → {sym} 50% ditutup</b> (sintetis)\n"
+                            await send(f"🎯 <b>TP1 kena → {sym} {s['tp1_frac']*100:g}% ditutup</b> (sintetis)\n"
                                        f"• mark ${mark:,.4f}{be_txt} · target TP2 ${s['tp2']:,.4f}")
                         continue
                 else:
                     if self._breached("tp", is_long, mark, s["tp2"]):
                         r = await self.close_position_market(sym)
+                        if not r.get("ok"):
+                            await self._close_fail(sym, s, r); continue
                         pnl = round((mark - entry_px) * amt, 4) if entry_px else 0.0
                         await self._synth_close(sym, s, mark, "TP2", r, entry_px, (s["realized"] + (pnl or 0.0)))
                         self._synth.pop(sym, None); return
                     if self._breached("sl", is_long, mark, s["sl"]):
                         r = await self.close_position_market(sym)
+                        if not r.get("ok"):
+                            await self._close_fail(sym, s, r); continue
                         pnl = round((mark - entry_px) * amt, 4) if entry_px else 0.0
                         # moved_be -> trade tetap WIN (TP1 sudah dibank); jika tidak, SL sisa
                         outcome = "TP1" if s["moved_be"] else "SL"
@@ -377,18 +427,38 @@ class Exchange:
         except asyncio.CancelledError:
             pass
 
+    async def _close_fail(self, sym, s, r):
+        """Close gagal -> log tiap kali, notifikasi Telegram SEKALI (anti-spam), loop tetap retry."""
+        log.error("SYNTH %s CLOSE GAGAL (retry): %s", sym, r.get("error"))
+        if not s.get("fail_notified"):
+            s["fail_notified"] = True
+            with contextlib.suppress(Exception):
+                from notify import send
+                await send(f"⚠️ <b>{sym} tutup posisi GAGAL — bot TERUS mencoba tiap "
+                           f"{CONFIG.synth_poll_sec:g}s</b>\n• {r.get('error')}\n"
+                           f"• Posisi tidak ditinggal telanjang; cek manual bila error menetap")
+
     async def _synth_close(self, sym, s, mark, which, r, entry=None, pnl_est=None):
         """Catat SATU baris jurnal terminal + notifikasi Telegram."""
         if r.get("ok"):
             try:
                 import journal
                 meta = s.get("meta") or {}
+                # v6.1 MFE dalam R: seberapa jauh harga bergerak ke arah kita sebelum ditutup
+                mfe_r = None
+                eref = s.get("entry_ref") or entry
+                mfe_px = s.get("mfe_price")
+                sl0 = s.get("sl0")
+                if eref and mfe_px is not None and sl0 is not None:
+                    R = abs(eref - sl0)
+                    if R > 0:
+                        mfe_r = round(((mfe_px - eref) if s["is_long"] else (eref - mfe_px)) / R, 2)
                 journal.record_trade(symbol=sym, outcome=which,
                                      side=("long" if s["is_long"] else "short"),
                                      entry=entry, exit_price=mark, sl=s["sl"], tp=s["tp2"],
                                      pnl_usd=pnl_est, mode="synthetic",
                                      regime=meta.get("regime"), confidence=meta.get("confidence"),
-                                     rr=meta.get("rr"))
+                                     rr=meta.get("rr"), mfe_r=mfe_r)
             except Exception:
                 pass
         with contextlib.suppress(Exception):
@@ -542,7 +612,14 @@ class Exchange:
         if not CONFIG.binance_api_key:
             out["error"] = "BINANCE_API_KEY belum di-set."; return out
         f = self.filters.get(sym) or {}
-        qty_str, qty = self.fmt_qty(decision["base_amount"], sym)
+        # v6 FIX -4005: batasi qty entry ke maxQty exchange (satu order tidak boleh > maxQty).
+        # Market entry pakai batas MARKET_LOT_SIZE; limit pakai LOT_SIZE.
+        req_qty = float(decision["base_amount"] or 0)
+        cap = (f.get("max_qty_market") if decision.get("entry_type") == "market" else f.get("max_qty")) or f.get("max_qty")
+        if cap and req_qty > cap:
+            out["warning"] = f"qty {req_qty:g} > maxQty {cap:g} -> dibatasi ke maxQty"
+            req_qty = cap
+        qty_str, qty = self.fmt_qty(req_qty, sym)
         if qty <= 0 or (f.get("min_qty") and qty < f["min_qty"]):
             out["error"] = f"qty {qty_str} < minQty {f.get('min_qty')}"; return out
         entry = decision["entry"]
