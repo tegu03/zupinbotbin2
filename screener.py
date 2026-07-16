@@ -55,26 +55,27 @@ def _adx(highs, lows, closes, period=14):
     return round(adx, 2)
 
 
-def _htf_dir(closes):
-    """Arah trend 1H: 'up'/'down'/'mixed' dari EMA50 vs EMA200 + slope EMA50."""
+def _htf_info(closes):
+    """Trend 1H + EMA200. Return (dir, ema200). Trend dari STRUKTUR EMA50-vs-EMA200 + slope
+    (bukan posisi harga sesaat) -> pullback dlm downtrend tetap 'down' (fix VANRY)."""
     if len(closes) < 60:
-        return "mixed"
+        return "mixed", None
     ema50 = _ema(closes, 50)
     ema200 = _ema(closes, 200) if len(closes) >= 200 else _ema(closes, min(len(closes) - 1, 100))
     prev = _ema(closes[:-10], 50) if len(closes) > 60 else ema50
     slope = ((ema50 - prev) / prev * 100) if (ema50 and prev) else 0.0
-    last = closes[-1]
     sep = ((ema50 - ema200) / ema200 * 100) if (ema50 and ema200) else 0.0
     SEP_MIN, SLOPE_MIN = 0.10, 0.02  # #7 anti-noise: pasar datar bukan trend
+    d = "mixed"
     if ema50 and ema200:
-        if last > ema50 and sep > SEP_MIN and slope > SLOPE_MIN:
-            return "up"
-        if last < ema50 and sep < -SEP_MIN and slope < -SLOPE_MIN:
-            return "down"
-    return "mixed"
+        if sep > SEP_MIN and slope > SLOPE_MIN:
+            d = "up"
+        elif sep < -SEP_MIN and slope < -SLOPE_MIN:
+            d = "down"
+    return d, ema200
 
 
-def score_symbol(closes, highs, lows, vols, htf_dir="mixed"):
+def score_symbol(closes, highs, lows, vols, htf_dir="mixed", htf_ema200=None):
     if len(closes) < 60:
         return None
     last = closes[-1]
@@ -100,6 +101,11 @@ def score_symbol(closes, highs, lows, vols, htf_dir="mixed"):
     # #6: TREND 1H WAJIB SEARAH — kandidat melawan trend 1H dibuang total
     if CONFIG.htf_align_required and htf_dir in ("up", "down"):
         if (direction == "long" and htf_dir != "up") or (direction == "short" and htf_dir != "down"):
+            return None
+    # v6.1 BARRIER EMA200(1H): buang long di bawah / short di atas EMA200 1H (fix VANRY,
+    # menutup celah 'mixed'). Ini menyaring counter-trend SEBELUM AI dipanggil.
+    if CONFIG.htf_align_required and htf_ema200:
+        if (direction == "long" and last < htf_ema200) or (direction == "short" and last > htf_ema200):
             return None
     score = 2.0 + min(abs(mom) / 2, 1.5) + min(max(vol_x - 1, 0), 1.0)
     if adx is not None:
@@ -145,11 +151,11 @@ async def screen(symbols):
             continue  # respons error (dict) / kosong -> bukan kandidat, bukan crash
         try:
             closes, highs, lows, vols = _closes_hlc(kl)
-            htf_dir = "mixed"
+            htf_dir, htf_ema200 = "mixed", None
             if isinstance(htf_kl, list) and htf_kl:
                 hc, _hh, _hl, _hv = _closes_hlc(htf_kl)
-                htf_dir = _htf_dir(hc)
-            sc = score_symbol(closes, highs, lows, vols, htf_dir)
+                htf_dir, htf_ema200 = _htf_info(hc)
+            sc = score_symbol(closes, highs, lows, vols, htf_dir, htf_ema200)
         except Exception:
             continue
         if sc:
