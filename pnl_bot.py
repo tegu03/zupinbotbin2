@@ -102,6 +102,31 @@ def _coin_line(per_coin):
     return "• " + " · ".join(parts) if parts else "• -"
 
 
+def _open_positions_block():
+    """v6.1: daftar coin yang SEDANG open posisi + unrealized (ditulis bot trading tiap siklus)."""
+    try:
+        positions, last_ts = journal.get_open_positions()
+    except Exception:
+        return None
+    lines = ["📌 <b>Posisi Terbuka</b>"]
+    if not positions:
+        lines.append("• Tidak ada posisi terbuka")
+        return "\n".join(lines)
+    for p in positions:
+        coin = journal._coin(p.get("symbol"))
+        icon = COIN_ICONS.get(coin, "🪙")
+        arrow = "📈" if str(p.get("side")) == "long" else "📉"
+        u = p.get("unrealized")
+        entry = p.get("entry")
+        lines.append(f"{icon} {coin} {arrow} {str(p.get('side')).upper()} · "
+                     f"masuk ${_f(entry)} · {_dot(u)} ${_sgn(u)}")
+    if last_ts:
+        age = time.time() - last_ts
+        if age > 20 * 60:
+            lines.append(f"• <i>⚠️ data {int(age / 60)} mnt lalu — bot trading mungkin berhenti</i>")
+    return "\n".join(lines)
+
+
 # ---- RENDER LAPORAN HARIAN ----
 def render_daily(iso_date):
     s = journal.stats_for_date(iso_date)
@@ -125,6 +150,11 @@ def render_daily(iso_date):
     lines.append(f"• Total: <b>{s['total']}</b> · WIN ✅ {s['tp']} · SL 🛑 {s['sl']}{be_txt} · WR <b>{wr}%</b>" if wr is not None
                  else f"• Total: <b>{s['total']}</b> · WIN ✅ {s['tp']} · SL 🛑 {s['sl']}{be_txt} · WR —")
     lines.append("")
+
+    _op = _open_positions_block()
+    if _op:
+        lines.append(_op)
+        lines.append("")
 
     lines.append("🪙 <b>Per Coin</b>")
     lines.append(_coin_line(s.get("per_coin", {})))
@@ -172,6 +202,11 @@ def render_period(label, start_iso, end_iso):
     if s.get("realized_usd"):
         lines.append(f"• Realized PnL: {_dot(s['realized_usd'])} ${_sgn(s['realized_usd'])}")
     lines.append("")
+
+    _op = _open_positions_block()
+    if _op:
+        lines.append(_op)
+        lines.append("")
 
     lines.append("🪙 <b>Per Coin</b>")
     lines.append(_coin_line(s.get("per_coin", {})))
