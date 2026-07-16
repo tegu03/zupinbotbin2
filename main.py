@@ -56,6 +56,8 @@ async def run_cycle(ex):
             initial_capital=account.get("base_capital_usd"),
             unrealized=account.get("unrealized_pnl_usd"),
             daily_pnl=account.get("realized_pnl_today_usd"))
+        # v6.1: tulis posisi terbuka saat ini -> dibaca pnl_bot utk laporan /pnl /week /month
+        journal.record_open_positions(account.get("positions") or [])
         log.info("SNAPSHOT RESULT=%s equity=%s daily_pnl=%s",
                  ok, account.get("equity_usd"), account.get("realized_pnl_today_usd"))
         for _sym in CONFIG.symbols:
