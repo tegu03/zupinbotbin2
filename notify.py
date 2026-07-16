@@ -38,6 +38,25 @@ def _f(x):
         return "n/a"
 
 
+def _price(x):
+    """Format harga adaptif: coin murah (ENA/DOGE) butuh desimal lebih banyak supaya
+    entry/SL/TP1/TP2 tidak terlihat sama karena pembulatan 2 desimal."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return "n/a"
+    a = abs(v)
+    if a >= 100:
+        d = 2
+    elif a >= 1:
+        d = 4
+    elif a >= 0.01:
+        d = 5
+    else:
+        d = 8
+    return f"{v:,.{d}f}"
+
+
 def _sgn(x):
     try:
         return ("+" if float(x) >= 0 else "") + _f(x)
@@ -59,10 +78,11 @@ def _num(x):
         return None
 
 
-def _header(account):
+def _header(account, symbol=None):
     a = account
+    sym = symbol or CONFIG.symbol
     return "\n".join([
-        f"🤖 <b>Zupin Bot</b> · {CONFIG.symbol} Perp · <b>Binance {_venue()}</b>",
+        f"🤖 <b>Zupin Bot</b> · {sym} Perp · <b>Binance {_venue()}</b>",
         "",
         "💰 <b>Modal &amp; PnL</b>",
         f"• Equity: <b>${_f(a.get('equity_usd'))}</b>  (awal ${_f(a.get('base_capital_usd'))})",
@@ -76,17 +96,18 @@ def format_trade(decision, account, exec_result):
     d, e = decision, exec_result
     dir_emoji = "📈" if d.get("signal") == "long" else "📉"
 
-    lines = [_header(account), ""]
-    lines.append(f"{dir_emoji} <b>ORDER {str(d.get('signal')).upper()}</b> · {_esc(d.get('symbol') or CONFIG.symbol)} · conf {d.get('confidence_pct')}%")
+    sym = d.get("symbol") or CONFIG.symbol
+    lines = [_header(account, sym), ""]
+    lines.append(f"{dir_emoji} <b>ORDER {str(d.get('signal')).upper()}</b> · {_esc(sym)} · conf {d.get('confidence_pct')}%")
     lines.append(f"• Regime: {_esc(d.get('regime'))}")
-    lines.append(f"• Entry: <b>${_f(d.get('entry'))}</b> ({_esc(d.get('entry_type'))})")
-    lines.append(f"• SL 🛑 ${_f(d.get('stop'))}")
+    lines.append(f"• Entry: <b>${_price(d.get('entry'))}</b> ({_esc(d.get('entry_type'))})")
+    lines.append(f"• SL 🛑 ${_price(d.get('stop'))}")
     frac = d.get("tp1_close_frac")
     frac_txt = f" (tutup {float(frac) * 100:g}%)" if frac else ""
-    lines.append(f"• TP1 🎯 ${_f(d.get('tp1'))} · RR 1:1{frac_txt}")
+    lines.append(f"• TP1 🎯 ${_price(d.get('tp1'))} · RR 1:1{frac_txt}")
     if d.get("tp2"):
         be_txt = " → SL sisa ke BE" if d.get("move_sl_to_be") else ""
-        lines.append(f"• TP2 🎯 ${_f(d.get('tp2'))} · RR 1:2{be_txt}")
+        lines.append(f"• TP2 🎯 ${_price(d.get('tp2'))} · RR 1:2{be_txt}")
     lines.append(f"• R:R ⚖️ {d.get('rr')} · risk 💵 ${_f(d.get('risk_usd'))} ({CONFIG.risk_pct * 100:g}%)")
     lines.append(f"• Size 📦 ${_f(d.get('notional_usd'))} · {d.get('base_amount')} {(d.get('symbol') or CONFIG.symbol)[:-4]}")
     if d.get("fee_est_usd") is not None:
