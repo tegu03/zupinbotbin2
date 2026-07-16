@@ -52,12 +52,18 @@ def init_db():
         if "order_id" not in cols:
             c.execute("ALTER TABLE trades ADD COLUMN order_id INTEGER")
         # v5.1: metadata keputusan untuk modul pembelajaran (lessons.py)
-        for col, typ in (("regime", "TEXT"), ("confidence", "REAL"), ("rr", "REAL")):
+        # v6.1: mfe_r = Maximum Favorable Excursion dalam R (seberapa jauh harga bergerak
+        # ke arah kita sebelum ditutup) -> bahan keputusan trailing stop nanti.
+        for col, typ in (("regime", "TEXT"), ("confidence", "REAL"), ("rr", "REAL"), ("mfe_r", "REAL")):
             if col not in cols:
                 c.execute(f"ALTER TABLE trades ADD COLUMN {col} {typ}")
         c.execute("""CREATE TABLE IF NOT EXISTS snapshots(
             ts INTEGER NOT NULL, date TEXT NOT NULL, equity REAL,
             initial_capital REAL, unrealized REAL, daily_pnl REAL)""")
+        # v6.1: snapshot posisi terbuka SAAT INI (ditulis bot trading tiap siklus, dibaca pnl_bot)
+        c.execute("""CREATE TABLE IF NOT EXISTS open_positions(
+            symbol TEXT PRIMARY KEY, side TEXT, size REAL, entry REAL,
+            unrealized REAL, ts INTEGER)""")
         c.execute("CREATE INDEX IF NOT EXISTS ix_trades_date ON trades(date)")
         c.execute("CREATE INDEX IF NOT EXISTS ix_snap_date ON snapshots(date)")
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_trades_oid ON trades(order_id) WHERE order_id IS NOT NULL")
@@ -66,20 +72,58 @@ def init_db():
 
 def record_trade(symbol, outcome, side=None, entry=None, exit_price=None,
                  sl=None, tp=None, pnl_usd=None, mode="synthetic", order_id=None, ts=None,
-                 regime=None, confidence=None, rr=None):
+                 regime=None, confidence=None, rr=None, mfe_r=None):
     ts = int(ts or time.time())
     _ensure_init()
     try:
         with closing(_conn()) as c:
             cur = c.execute(
-                """INSERT OR IGNORE INTO trades(ts,date,symbol,outcome,side,entry,exit_price,sl,tp,pnl_usd,mode,order_id,regime,confidence,rr)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                """INSERT OR IGNORE INTO trades(ts,date,symbol,outcome,side,entry,exit_price,sl,tp,pnl_usd,mode,order_id,regime,confidence,rr,mfe_r)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (ts, _date_wib(ts), str(symbol).upper(), str(outcome).upper(), side,
-                 entry, exit_price, sl, tp, pnl_usd, mode, order_id, regime, confidence, rr))
+                 entry, exit_price, sl, tp, pnl_usd, mode, order_id, regime, confidence, rr, mfe_r))
             c.commit()
             return cur.rowcount == 1
     except Exception:
         return False
+
+
+def record_open_positions(positions, ts=None):
+    """v6.1: tulis snapshot posisi terbuka SAAT INI (dipanggil bot trading tiap siklus).
+    positions: list dict {market/symbol, size, entry_price, sign/side, unrealized_pnl_usd}."""
+    ts = int(ts or time.time())
+    _ensure_init()
+    try:
+        with closing(_conn()) as c:
+            c.execute("DELETE FROM open_positions")
+            for p in (positions or []):
+                sym = str(p.get("market") or p.get("symbol") or "").upper()
+                if not sym:
+                    continue
+                size = p.get("size")
+                side = p.get("sign") or ("long" if (size or 0) > 0 else "short")
+                c.execute("""INSERT OR REPLACE INTO open_positions(symbol,side,size,entry,unrealized,ts)
+                             VALUES(?,?,?,?,?,?)""",
+                          (sym, side, size, p.get("entry_price"), p.get("unrealized_pnl_usd"), ts))
+            c.commit()
+        return True
+    except Exception:
+        return False
+
+
+def get_open_positions():
+    """v6.1: -> (list posisi terbuka, ts terakhir ditulis) untuk pnl_bot."""
+    _ensure_init()
+    try:
+        with closing(_conn()) as c:
+            rows = c.execute("""SELECT symbol,side,size,entry,unrealized,ts FROM open_positions
+                                ORDER BY symbol""").fetchall()
+        out = [{"symbol": r[0], "side": r[1], "size": r[2], "entry": r[3],
+                "unrealized": r[4], "ts": r[5]} for r in rows]
+        last_ts = max((r["ts"] for r in out if r["ts"]), default=None)
+        return out, last_ts
+    except Exception:
+        return [], None
 
 
 # v6: outcome ladder. WIN = target profit tercapai (penuh/sebagian), LOSS = SL murni.
